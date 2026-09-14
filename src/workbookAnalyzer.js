@@ -1,106 +1,19 @@
 import * as XLSX from "xlsx";
 
-const HEADER_WORDS = ["name","date","age","sex","gender","status","outcome","county","ward","facility","site","quarter","month","year","target","result","unique","identifier","code","service","hiv","art","tb","prep","pep","sti","screen","received","provided","started","completed","client","kp","vp"];
-const NULL_WORDS = new Set(["","n/a","na","n.a.","null","none","-","—"]);
-
-function text(v) {
-  if (v === null || v === undefined) return "";
-  if (v instanceof Date && !Number.isNaN(v.getTime())) return v.toISOString().slice(0, 10);
-  if (typeof v === "object") {
-    if (v.result !== undefined) return text(v.result);
-    if (v.text !== undefined) return text(v.text);
-  }
-  return String(v).replace(/\s+/g, " ").trim();
-}
-function isBlank(v) { return v === null || v === undefined || NULL_WORDS.has(String(v).trim().toLowerCase()); }
-function numeric(v) {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v !== "string") return null;
-  const s = v.replace(/,/g, "").replace(/%/g, "").trim();
-  if (!s || NULL_WORDS.has(s.toLowerCase())) return null;
-  const n = Number(s); return Number.isFinite(n) ? n : null;
-}
-function dateValue(v) {
-  if (v instanceof Date && !Number.isNaN(v.getTime())) return v;
-  if (typeof v === "number" && v > 20000 && v < 60000) {
-    const d = XLSX.SSF.parse_date_code(v); if (d) return new Date(Date.UTC(d.y, d.m - 1, d.d));
-  }
-  if (typeof v !== "string") return null;
-  const s = v.trim();
-  if (!/^\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}$/.test(s) && !/^\d{4}[\/-]\d{1,2}[\/-]\d{1,2}$/.test(s)) return null;
-  const p = s.split(/[\/-]/).map(Number);
-  const d = p[0] > 31 ? new Date(Date.UTC(p[0], p[1] - 1, p[2])) : new Date(Date.UTC(p[2] < 100 ? 2000 + p[2] : p[2], p[1] - 1, p[0]));
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-function headerScore(row, rowIndex) {
-  const values = row.map(text).filter(Boolean); if (!values.length) return -Infinity;
-  const unique = new Set(values.map(v => v.toLowerCase())).size;
-  const hits = values.reduce((n,v) => n + (HEADER_WORDS.some(k => v.toLowerCase().includes(k)) ? 1 : 0), 0);
-  const strings = values.filter(v => Number.isNaN(Number(v))).length;
-  return values.length * 2 + hits * 4 + unique / values.length * 8 + strings * .25 - rowIndex * .15;
-}
-function findHeaderRow(grid) {
-  let best = 0, score = -Infinity;
-  for (let i = 0; i < Math.min(20, grid.length); i++) { const s = headerScore(grid[i] || [], i); if (s > score) { score = s; best = i; } }
-  return best;
-}
-function makeHeaders(grid, headerRow, width) {
-  const used = new Map(); const headers = [];
-  for (let c = 0; c < width; c++) {
-    const current = text(grid[headerRow]?.[c]); const above = text(grid[headerRow - 1]?.[c]); const above2 = text(grid[headerRow - 2]?.[c]);
-    let label = current || above || `Column ${c + 1}`;
-    if (current && above && above !== current && !/^\d+$/.test(above)) label = `${above} :: ${current}`;
-    else if (!current && above) label = above;
-    else if (current && !above && above2 && !/^\d+$/.test(above2)) label = `${above2} :: ${current}`;
-    const count = used.get(label) || 0; used.set(label, count + 1); headers.push(count ? `${label} (${count + 1})` : label);
-  }
-  return headers;
-}
-function topValues(map, limit = 12) { return [...map.entries()].sort((a,b) => b[1] - a[1]).slice(0,limit).map(([value,count]) => ({value,count})); }
-function makeColumnStats(headers) {
-  return headers.map((name,index) => ({ index,name,nonEmpty:0,missing:0,numericCount:0,dateCount:0,textCount:0,formulaCount:0,errorCount:0,min:null,max:null,sum:0,unique:new Set(),frequencies:new Map() }));
-}
-function updateColumn(stat,value,formula) {
-  if (formula) stat.formulaCount++;
-  if (isBlank(value)) { stat.missing++; return; }
-  stat.nonEmpty++;
-  const s = text(value);
-  if (/#REF!|#DIV\/0!|#VALUE!|#NAME\?|#N\/A/.test(s)) stat.errorCount++;
-  if (stat.unique.size < 50000) stat.unique.add(s);
-  if (stat.frequencies.size < 5000) stat.frequencies.set(s,(stat.frequencies.get(s)||0)+1);
-  const n = numeric(value), d = dateValue(value);
-  if (n !== null && !(typeof value === "string" && /[\/-]/.test(value))) {
-    stat.numericCount++; stat.sum += n; stat.min = stat.min === null ? n : Math.min(stat.min,n); stat.max = stat.max === null ? n : Math.max(stat.max,n);
-  } else if (d) {
-    stat.dateCount++; stat.min = stat.min === null ? d : stat.min < d ? stat.min : d; stat.max = stat.max === null ? d : stat.max > d ? stat.max : d;
-  } else stat.textCount++;
-}
-function finalizeColumn(stat,rowCount) {
-  const nonEmpty = stat.nonEmpty || 0; let type = "text";
-  if (!nonEmpty) type = "empty"; else if (stat.dateCount / nonEmpty >= .8) type = "date"; else if (stat.numericCount / nonEmpty >= .8) type = "numeric"; else if (stat.unique.size / Math.max(nonEmpty,1) <= .65) type = "category";
-  return { index:stat.index,name:stat.name,type,nonEmpty:stat.nonEmpty,missing:rowCount-stat.nonEmpty,missingPct:rowCount ? stat.missing/rowCount*100 : 0,unique:stat.unique.size,formulaCount:stat.formulaCount,errorCount:stat.errorCount,sum:stat.numericCount ? stat.sum : null,average:stat.numericCount ? stat.sum/stat.numericCount : null,min:stat.min instanceof Date ? stat.min.toISOString().slice(0,10) : stat.min,max:stat.max instanceof Date ? stat.max.toISOString().slice(0,10) : stat.max,topValues:topValues(stat.frequencies)};
-}
-function detectFormulaErrors(sheet) {
-  let formulas=0,errors=0; const range=XLSX.utils.decode_range(sheet["!ref"]||"A1:A1");
-  for(let r=range.s.r;r<=range.e.r;r++) for(let c=range.s.c;c<=range.e.c;c++) { const cell=sheet[XLSX.utils.encode_cell({r,c})]; if(!cell) continue; if(cell.f){formulas++;if(/#REF!|#DIV\/0!|#VALUE!/.test(String(cell.f)))errors++;} if(typeof cell.v === "string" && /#REF!|#DIV\/0!|#VALUE!|#NAME\?|#N\/A/.test(cell.v)) errors++; }
-  return {formulas,errors};
-}
-function analyzeSheet(sheetName,sheet) {
-  const ref=sheet["!ref"]; if(!ref) return {name:sheetName,rows:0,columns:0,headerRow:0,fields:[],rowCount:0,formulaCount:0,formulaErrors:0,insights:[],charts:[]};
-  const grid=XLSX.utils.sheet_to_json(sheet,{header:1,defval:null,raw:true,blankrows:false});
-  const width=XLSX.utils.decode_range(ref).e.c+1, headerRow=findHeaderRow(grid), headers=makeHeaders(grid,headerRow,width), stats=makeColumnStats(headers); let rowCount=0;
-  for(let r=headerRow+1;r<grid.length;r++) { const row=grid[r]||[]; let has=false; for(let c=0;c<width;c++){const value=row[c];if(!isBlank(value))has=true;const cell=sheet[XLSX.utils.encode_cell({r,c})];updateColumn(stats[c],value,Boolean(cell?.f));} if(has)rowCount++; }
-  const fields=stats.map(s=>finalizeColumn(s,rowCount)); const meta=detectFormulaErrors(sheet);
-  const numericFields=fields.filter(f=>f.type==="numeric"), categoryFields=fields.filter(f=>f.type==="category"), dateFields=fields.filter(f=>f.type==="date");
-  const charts=[]; if(categoryFields[0])charts.push({type:"bar",dimension:categoryFields[0].name,measure:numericFields[0]?.name||null,data:categoryFields[0].topValues}); if(categoryFields[1])charts.push({type:"pie",dimension:categoryFields[1].name,measure:null,data:categoryFields[1].topValues.slice(0,8)});
-  const insights=[]; if(categoryFields[0]?.topValues[0])insights.push(`${categoryFields[0].topValues[0].value} is the largest ${categoryFields[0].name} group (${categoryFields[0].topValues[0].count}).`); if(numericFields[0])insights.push(`${numericFields[0].name} totals ${Math.round(numericFields[0].sum*100)/100} across ${numericFields[0].numericCount.toLocaleString()} populated records.`); const missing=fields.filter(f=>f.missing>0).sort((a,b)=>b.missingPct-a.missingPct)[0]; if(missing)insights.push(`${missing.name} has ${missing.missingPct.toFixed(1)}% missing values.`); if(meta.errors)insights.push(`${meta.errors.toLocaleString()} formula/error cells require attention.`);
-  return {name:sheetName,rows:grid.length,columns:width,headerRow:headerRow+1,rowCount,fields,numericFields:numericFields.map(f=>f.name),categoryFields:categoryFields.map(f=>f.name),dateFields:dateFields.map(f=>f.name),formulaCount:meta.formulas,formulaErrors:meta.errors,insights,charts};
-}
-export async function analyzeWorkbook(file,onProgress=()=>{}) {
-  const buffer=await file.arrayBuffer(); const workbook=XLSX.read(buffer,{type:"array",cellDates:true,cellFormula:true,cellNF:true,cellText:true}); const sheets=[];
-  for(let i=0;i<workbook.SheetNames.length;i++){const name=workbook.SheetNames[i];onProgress({current:i+1,total:workbook.SheetNames.length,name});sheets.push(analyzeSheet(name,workbook.Sheets[name]));await new Promise(r=>setTimeout(r,0));}
-  const allFields=sheets.flatMap(s=>s.fields.map(f=>({...f,sheet:s.name}))); const totalRows=sheets.reduce((a,s)=>a+s.rowCount,0); const totalColumns=sheets.reduce((a,s)=>a+s.columns,0); const totalMissing=allFields.reduce((a,f)=>a+f.missing,0); const totalCells=sheets.reduce((a,s)=>a+s.rowCount*s.columns,0)||1; const totalFormulaErrors=sheets.reduce((a,s)=>a+s.formulaErrors,0);
-  return {fileName:file.name,fileSize:file.size,sheets,totals:{sheets:sheets.length,rows:totalRows,columns:totalColumns,fields:allFields.length,missing:totalMissing,missingPct:totalMissing/totalCells*100,formulaErrors:totalFormulaErrors},topFields:allFields.filter(f=>f.type!=="empty").sort((a,b)=>b.nonEmpty-a.nonEmpty).slice(0,25)};
-}
-export function workbookInsights(model){const out=[];const {sheets,totals}=model;const largest=[...sheets].sort((a,b)=>b.rowCount-a.rowCount)[0];if(largest)out.push(`${largest.name} is the largest data sheet with ${largest.rowCount.toLocaleString()} populated records and ${largest.columns.toLocaleString()} columns.`);out.push(`${totals.sheets} worksheets and ${totals.fields.toLocaleString()} detected fields were scanned.`);if(totals.formulaErrors)out.push(`${totals.formulaErrors.toLocaleString()} formula/error cells were detected, including broken references where present.`);out.push(`${totals.missingPct.toFixed(1)}% of analyzed cells are blank or marked as missing.`);const n=model.topFields.find(f=>f.type==="numeric");if(n)out.push(`${n.name} is the strongest numeric field by populated records (${n.nonEmpty.toLocaleString()}).`);return out.slice(0,6);}
-export {numeric,dateValue};
+const NULLS=new Set(["","n/a","na","n.a.","null","none","-","—"]);
+const KEYWORDS=["name","date","age","sex","gender","status","outcome","county","ward","facility","site","month","year","target","result","unique","identifier","code","service","hiv","art","tb","prep","pep","sti","screen","received","provided","started","completed","client","kp","vp","fsw","msm"];
+const s=v=>v==null?"":v instanceof Date?v.toISOString().slice(0,10):typeof v==="object"?(v.result!==undefined?s(v.result):v.text!==undefined?s(v.text):String(v)):String(v).replace(/\s+/g," ").trim();
+const blank=v=>v==null||NULLS.has(s(v).toLowerCase());
+const num=v=>{if(typeof v==="number"&&Number.isFinite(v))return v;if(typeof v!=="string")return null;const n=Number(v.replace(/,/g,"").replace(/%/g,"").trim());return Number.isFinite(n)?n:null};
+function date(v){if(v instanceof Date&&!Number.isNaN(v.getTime()))return v;if(typeof v==="number"&&v>20000&&v<60000){const d=XLSX.SSF.parse_date_code(v);return d?new Date(Date.UTC(d.y,d.m-1,d.d)):null}if(typeof v!=="string")return null;let p=v.trim().split(/[\/-]/).map(Number);if(p.length!==3)return null;let d=p[0]>31?new Date(Date.UTC(p[0],p[1]-1,p[2])):new Date(Date.UTC(p[2]<100?2000+p[2]:p[2],p[1]-1,p[0]));return Number.isNaN(d.getTime())?null:d}
+function headerRow(g){let best=0,score=-1e9;for(let r=0;r<Math.min(25,g.length);r++){let a=(g[r]||[]).map(s).filter(Boolean),hits=a.reduce((n,x)=>n+(KEYWORDS.some(k=>x.toLowerCase().includes(k))?1:0),0),sc=a.length*2+hits*5+new Set(a.map(x=>x.toLowerCase())).size*.5-r*.1;if(sc>score){score=sc;best=r}}return best}
+function headers(g,r,w){const used=new Map();return Array.from({length:w},(_,c)=>{let cur=s(g[r]?.[c]),up=s(g[r-1]?.[c]),v=cur||up||`Column ${c+1}`;if(cur&&up&&up!==cur&&!/^\d+$/.test(up))v=`${up} :: ${cur}`;let n=used.get(v)||0;used.set(v,n+1);return n?`${v} (${n+1})`:v})}
+function top(map,n=15){return [...map.entries()].sort((a,b)=>b[1]-a[1]).slice(0,n).map(([value,count])=>({value,count}))}
+function statsFor(g,hr,hs,w){const a=hs.map((name,index)=>({index,name,nonEmpty:0,missing:0,numeric:0,dates:0,text:0,errors:0,sum:0,min:null,max:null,unique:new Set(),freq:new Map()}));let rows=[];for(let r=hr+1;r<g.length;r++){let row=g[r]||[],has=false;for(let c=0;c<w;c++){let v=row[c];if(!blank(v))has=true;let st=a[c];if(blank(v)){st.missing++;continue}st.nonEmpty++;let x=s(v);if(/#REF!|#DIV\/0!|#VALUE!|#NAME\?|#N\/A/i.test(x))st.errors++;if(st.unique.size<50000)st.unique.add(x);if(st.freq.size<5000)st.freq.set(x,(st.freq.get(x)||0)+1);let n=num(v),d=date(v);if(n!==null&&!(/[\/-]/.test(x)&&typeof v==="string")){st.numeric++;st.sum+=n;st.min=st.min===null?n:Math.min(st.min,n);st.max=st.max===null?n:Math.max(st.max,n)}else if(d){st.dates++;st.min=st.min===null?d:st.min<d?st.min:d;st.max=st.max===null?d:st.max>d?st.max:d}else st.text++}if(has)rows.push(row)}return {rows,fields:a.map(st=>{let type=!st.nonEmpty?"empty":st.dates/st.nonEmpty>.8?"date":st.numeric/st.nonEmpty>.8?"numeric":st.unique.size/Math.max(1,st.nonEmpty)<=.65?"category":"text";return {index:st.index,name:st.name,type,nonEmpty:st.nonEmpty,missing:st.missing,missingPct:rows.length?st.missing/rows.length*100:0,unique:st.unique.size,errorCount:st.errors,sum:st.numeric?st.sum:null,average:st.numeric?st.sum/st.numeric:null,min:st.min instanceof Date?st.min.toISOString().slice(0,10):st.min,max:st.max instanceof Date?st.max.toISOString().slice(0,10):st.max,topValues:top(st.freq)}})} }
+function cross(rows,fields){const out=[];const cats=fields.filter(f=>f.type==="category").slice(0,10);for(let i=0;i<cats.length;i++)for(let j=i+1;j<cats.length;j++){const a=cats[i],b=cats[j],map=new Map();for(const row of rows){const av=s(row[a.index]),bv=s(row[b.index]);if(!av||!bv)continue;const k=`${av}|||${bv}`;map.set(k,(map.get(k)||0)+1)}const pairs=[...map.entries()].sort((x,y)=>y[1]-x[1]).slice(0,12).map(([k,count])=>{const [x,y]=k.split("|||");return{x,y,count}});if(pairs.length)out.push({x:a.name,y:b.name,pairs})}return out.slice(0,12)}
+function numericRelations(rows,fields){const nums=fields.filter(f=>f.type==="numeric").slice(0,20);const rel=[];for(let i=0;i<nums.length;i++)for(let j=i+1;j<nums.length;j++){let xs=[],ys=[];for(const r of rows){const x=num(r[nums[i].index]),y=num(r[nums[j].index]);if(x!==null&&y!==null){xs.push(x);ys.push(y)}}if(xs.length<3)continue;const ax=xs.reduce((a,b)=>a+b,0)/xs.length,ay=ys.reduce((a,b)=>a+b,0)/ys.length;let xy=0,xx=0,yy=0;for(let k=0;k<xs.length;k++){const dx=xs[k]-ax,dy=ys[k]-ay;xy+=dx*dy;xx+=dx*dx;yy+=dy*dy}const r=xx&&yy?xy/Math.sqrt(xx*yy):0;if(Math.abs(r)>=.45)rel.push({x:nums[i].name,y:nums[j].name,correlation:Number(r.toFixed(3)),n:xs.length})}return rel.sort((a,b)=>Math.abs(b.correlation)-Math.abs(a.correlation)).slice(0,12)}
+function quality(rows,fields){const duplicates=new Set(),seen=new Set();for(const r of rows){const k=JSON.stringify(r);if(seen.has(k))duplicates.add(k);seen.add(k)}const outliers=[];for(const f of fields.filter(x=>x.type==="numeric")){const vals=rows.map(r=>num(r[f.index])).filter(x=>x!==null).sort((a,b)=>a-b);if(vals.length<8)continue;const q1=vals[Math.floor(vals.length*.25)],q3=vals[Math.floor(vals.length*.75)],iqr=q3-q1,lo=q1-1.5*iqr,hi=q3+1.5*iqr;const count=vals.filter(v=>v<lo||v>hi).length;if(count)outliers.push({field:f.name,count,lower:lo,upper:hi})}return {duplicateRows:duplicates.size,outliers:outliers.sort((a,b)=>b.count-a.count).slice(0,15)}}
+function analyzeSheet(name,sheet){const ref=sheet["!ref"];if(!ref)return {name,rows:0,columns:0,headerRow:0,rowCount:0,fields:[],formulaCount:0,formulaErrors:0,analytics:{}};const g=XLSX.utils.sheet_to_json(sheet,{header:1,defval:null,raw:true,blankrows:false}),w=XLSX.utils.decode_range(ref).e.c+1,hr=headerRow(g),hs=headers(g,hr,w),r=statsFor(g,hr,hs,w),rows=r.rows,fields=r.fields;let formulas=0,formulaErrors=0;const range=XLSX.utils.decode_range(ref);for(let rr=range.s.r;rr<=range.e.r;rr++)for(let c=range.s.c;c<=range.e.c;c++){const cell=sheet[XLSX.utils.encode_cell({r:rr,c})];if(cell?.f)formulas++;if(/#REF!|#DIV\/0!|#VALUE!|#NAME\?|#N\/A/i.test(String(cell?.v??"")))formulaErrors++}const cat=fields.filter(f=>f.type==="category"),numeric=fields.filter(f=>f.type==="numeric"),dates=fields.filter(f=>f.type==="date");const insights=[];if(cat[0]?.topValues[0])insights.push(`${cat[0].topValues[0].value} is the largest ${cat[0].name} group (${cat[0].topValues[0].count}).`);if(numeric[0])insights.push(`${numeric[0].name} totals ${numeric[0].sum} across ${numeric[0].nonEmpty} populated values.`);const miss=fields.filter(f=>f.missing>0).sort((a,b)=>b.missingPct-a.missingPct)[0];if(miss)insights.push(`${miss.name} has ${miss.missingPct.toFixed(1)}% missing values.`);if(formulaErrors)insights.push(`${formulaErrors} formula/error cells were detected.`);return {name,rows:g.length,columns:w,headerRow:hr+1,rowCount:rows.length,fields,numericFields:numeric.map(f=>f.name),categoryFields:cat.map(f=>f.name),dateFields:dates.map(f=>f.name),formulaCount:formulas,formulaErrors,insights,charts:cat.slice(0,3).map(f=>({type:"bar",dimension:f.name,data:f.topValues})),analytics:{crossTabs:cross(rows,fields),numericRelations:numericRelations(rows,fields),quality:quality(rows,fields)}}}
+export async function analyzeWorkbook(file,onProgress=()=>{}){const wb=XLSX.read(await file.arrayBuffer(),{type:"array",cellDates:true,cellFormula:true,cellNF:true,cellText:true}),sheets=[];for(let i=0;i<wb.SheetNames.length;i++){const name=wb.SheetNames[i];onProgress({current:i+1,total:wb.SheetNames.length,name});sheets.push(analyzeSheet(name,wb.Sheets[name]));await new Promise(r=>setTimeout(r,0))}const all=sheets.flatMap(s=>s.fields.map(f=>({...f,sheet:s.name}))),totalRows=sheets.reduce((a,s)=>a+s.rowCount,0),totalCols=sheets.reduce((a,s)=>a+s.columns,0),missing=all.reduce((a,f)=>a+f.missing,0),cells=sheets.reduce((a,s)=>a+s.rowCount*s.columns,0)||1;return {fileName:file.name,fileSize:file.size,sheets,totals:{sheets:sheets.length,rows:totalRows,columns:totalCols,fields:all.length,missing,missingPct:missing/cells*100,formulaErrors:sheets.reduce((a,s)=>a+s.formulaErrors,0)},topFields:all.filter(f=>f.type!=="empty").sort((a,b)=>b.nonEmpty-a.nonEmpty).slice(0,30),workbookAnalytics:{quality:{duplicateRows:sheets.reduce((a,s)=>a+s.analytics.quality.duplicateRows,0),outliers:sheets.flatMap(s=>s.analytics.quality.outliers)},crossTabs:sheets.flatMap(s=>s.analytics.crossTabs.map(x=>({...x,sheet:s.name}))),numericRelations:sheets.flatMap(s=>s.analytics.numericRelations.map(x=>({...x,sheet:s.name})))}}}
+export function workbookInsights(m){const out=[],largest=[...m.sheets].sort((a,b)=>b.rowCount-a.rowCount)[0];if(largest)out.push(`${largest.name} is the largest sheet with ${largest.rowCount.toLocaleString()} populated records.`);out.push(`${m.totals.sheets} worksheets, ${m.totals.fields.toLocaleString()} fields and ${m.totals.rows.toLocaleString()} populated records were scanned.`);if(m.workbookAnalytics.quality.duplicateRows)out.push(`${m.workbookAnalytics.quality.duplicateRows.toLocaleString()} duplicate rows were detected.`);if(m.workbookAnalytics.quality.outliers.length)out.push(`${m.workbookAnalytics.quality.outliers.length} numeric fields contain potential outliers.`);if(m.workbookAnalytics.numericRelations.length){const r=m.workbookAnalytics.numericRelations[0];out.push(`Strongest numeric relationship: ${r.x} vs ${r.y} (correlation ${r.correlation}).`)}if(m.workbookAnalytics.crossTabs.length){const x=m.workbookAnalytics.crossTabs[0];out.push(`Cross-tab analysis is available for ${x.x} × ${x.y}.`)}out.push(`${m.totals.missingPct.toFixed(1)}% of analyzed cells are blank or marked missing.`);return out.slice(0,6)}
+export {num,date};
