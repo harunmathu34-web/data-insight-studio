@@ -13,7 +13,7 @@ self.onmessage = async (event) => {
       cellHTML: false,
       cellNF: false,
       cellStyles: false,
-      cellDates: true,
+      cellDates: false,
     });
 
     const names = workbook.SheetNames || [];
@@ -40,10 +40,6 @@ self.onmessage = async (event) => {
         progress: start,
       });
 
-      // Analyze one sheet at a time instead of sending the whole workbook
-      // through one giant operation. This gives the UI a real checkpoint
-      // after every worksheet and avoids retaining multiple parsed sheets
-      // inside the analyzer at once.
       const oneSheetWorkbook = {
         SheetNames: [name],
         Sheets: { [name]: workbook.Sheets[name] },
@@ -59,8 +55,6 @@ self.onmessage = async (event) => {
         workbookFormulaErrors += analyzed.quality?.formulaErrors || 0;
         workbookDuplicateRows += analyzed.quality?.duplicateRows || 0;
 
-        // Prefer Register as the main cohort, otherwise use the first sheet
-        // that contains usable cohort intelligence.
         if (!cohort && analyzed.cohort) cohort = analyzed.cohort;
         if (/register/i.test(name) && analyzed.cohort) cohort = analyzed.cohort;
       }
@@ -71,7 +65,6 @@ self.onmessage = async (event) => {
         progress: Math.min(96, start + Math.round(90 / Math.max(names.length, 1))),
       });
 
-      // Yield back to the worker event loop between worksheets.
       await new Promise(resolve => setTimeout(resolve, 0));
     }
 
@@ -91,6 +84,6 @@ self.onmessage = async (event) => {
     const insights = workbookInsights(result);
     self.postMessage({ type: "done", result, insights, progress: 100 });
   } catch (error) {
-    self.postMessage({ type: "error", message: error?.message || String(error) });
+    self.postMessage({ type: "error", message: error?.stack || error?.message || String(error) });
   }
 };
